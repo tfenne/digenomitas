@@ -24,7 +24,8 @@ class IdentifyCutSitesTest extends UnitSpec {
     enzyme                = Some("SpyCas9"),
     pamFivePrime          = None,
     pamThreePrime         = Some("NGG"),
-    overhang              = 0,
+    minOverhang           = 0,
+    maxOverhang           = 0,
     maxOffset             = 2,
     minDepth              = 10,
     maxDepth              = 300,
@@ -350,7 +351,7 @@ class IdentifyCutSitesTest extends UnitSpec {
     forloop(from=0, until=9)  { i => builder.addPair(start1=1502, start2=1711) }
 
     acc ++= builder
-    acc.build(1500, DefaultParams.copy(overhang=0, maxOffset=1)) match {
+    acc.build(1500, DefaultParams.withOverhang(0).copy(maxOffset=1)) match {
       case None => fail("Failed to generate a cut site at pos=1500.")
       case Some(cut) =>
         cut.strand shouldBe "F" // guide "should" match F strand
@@ -374,7 +375,7 @@ class IdentifyCutSitesTest extends UnitSpec {
     forloop(from=0, until=31) { i => builder.addPair(start1=1500, start2=1700) }
 
     acc ++= builder
-    acc.build(1500, DefaultParams.copy(overhang=0, maxOffset=1)) match {
+    acc.build(1500, DefaultParams.withOverhang(0).copy(maxOffset=1)) match {
       case None => fail("Failed to generate a cut site at pos=1500.")
       case Some(cut) =>
         cut.strand shouldBe "R" // guide "should" match R strand
@@ -399,7 +400,7 @@ class IdentifyCutSitesTest extends UnitSpec {
 
     acc ++= builder
     (0 to 3) foreach { offset =>
-      acc.build(1500, DefaultParams.copy(overhang=0, maxOffset=offset)) match {
+      acc.build(1500, DefaultParams.withOverhang(0).copy(maxOffset=offset)) match {
         case None      => fail("Failed to generate a cut site at pos=1500.")
         case Some(cut) =>
           cut.strand shouldBe "F" // guide "should" match F strand
@@ -420,7 +421,7 @@ class IdentifyCutSitesTest extends UnitSpec {
 
     acc ++= builder
     (0 to 3) foreach { offset =>
-      acc.build(1500, DefaultParams.copy(overhang=0, maxOffset=offset)) match {
+      acc.build(1500, DefaultParams.withOverhang(0).copy(maxOffset=offset)) match {
         case None      => fail("Failed to generate a cut site at pos=1500.")
         case Some(cut) =>
           cut.strand shouldBe "R" // guide "should" match R strand
@@ -474,7 +475,7 @@ class IdentifyCutSitesTest extends UnitSpec {
      val bams = builders.map(_.toTempFile())
      val out = makeTempFile("metrics.", ".txt")
      new IdentifyCutSites(input=bams, output=out, guide=Some("CTATTTCTCGATCGATCGAT"), pamThreePrime=Some("NGG"), enzyme=Some("SpyCas9"),
-       ref=refFile, overhang= -2, maxOffset=1, minDepth=5).execute()
+       ref=refFile, overhang=Seq(-2), maxOffset=1, minDepth=5).execute()
      val metrics = Metric.read[CutSiteInfo](out)
 
      metrics.size shouldBe 1
