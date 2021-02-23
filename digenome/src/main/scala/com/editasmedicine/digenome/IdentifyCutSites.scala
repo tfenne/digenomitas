@@ -1,7 +1,6 @@
 package com.editasmedicine.digenome
 
 import java.io.Closeable
-
 import com.editasmedicine.aligner.Aligner
 import com.editasmedicine.commons.clp.{ClpGroups, EditasTool}
 import com.fulcrumgenomics.FgBioDef._
@@ -17,6 +16,7 @@ import htsjdk.samtools.util.{CoordMath, Interval, IntervalList}
 import org.apache.commons.math3.distribution.PoissonDistribution
 
 import scala.collection.mutable
+import scala.collection.mutable.ArrayBuffer
 import scala.math.{log10, max, min}
 
 object IdentifyCutSites {
@@ -205,7 +205,9 @@ object IdentifyCutSites {
         None
       }
       else {
-        val cuts = params.overhangs.flatMap { overhang =>
+        val candidates = new ArrayBuffer[CutSiteInfo](params.overhangs.size * 2)
+
+        params.overhangs.foreach { overhang =>
           // Construct a neighborhood measure of start site frequency vs. depth. The measure will be approximately
           // 1 when the rate of start sites vs. depth is expected/random, and approximately 0 when there is coverage
           // but no read starts.
@@ -228,7 +230,7 @@ object IdentifyCutSites {
           lazy val alignment = params.guidePlusPam.map(query => this.aligner.align(query, chrom, pos))
 
           // fwd = Guide matches fwd sequence, binds to rev strand, yielding clean cut on rev and variable cut on fwd strand
-          val fwd = {
+          {
             val fPos           = pos + 1 - overhang
             val fRange         = Range.inclusive(fPos - params.maxOffset, fPos + params.maxOffset)
             val fs             = fRange.map(fStarts)
@@ -239,42 +241,45 @@ object IdentifyCutSites {
             val depth          = readDepth(pos) + bonusDepth
             val tDepth         = templateDepth(pos) + bonusDepth
 
-            if (!ok(fStartCount, rStartCount, depth, params)) None else Some(CutSiteInfo(
-              sample                = sample,
-              guide                 = params.guide.getOrElse(""),
-              enzyme                = params.enzyme.getOrElse(""),
-              expected_overhang     = overhang,
-              window_size           = params.maxOffset * 2 + 1,
-              mapq_cutoff           = this.minMapQ,
-              chrom                 = chrom,
-              pos                   = pos - 1,
-              strand                = "F",
-              low_mapq_fraction     = lowMapqFraction(pos),
-              forward_starts        = fStartCount,
-              reverse_starts        = rStartCount,
-              read_depth            = depth,
-              template_depth        = tDepth,
-              read_fraction_cut     = (fStartCount + rStartCount) / depth.toDouble,
-              read_score            = score(pValue(fStartCount+rStartCount, depth, params.readStartProbability)),
-              template_fraction_cut = (fStartCount + rStartCount) / tDepth.toDouble,
-              template_score        = score(pValue(fStartCount+rStartCount, tDepth, params.templateStartProbability)),
-              median_overhang       = medianOverhang,
-              overhang_distribution = fs.mkString(";"),
-              neighborhood_ratio    = nearby,
-              aln_start             = alignment.map(_.start - 1).getOrElse(-1),
-              aln_end               = alignment.map(_.end).getOrElse(-1),
-              aln_strand            = alignment.map(_.strand.toString).getOrElse(""),
-              aln_padded_guide      = alignment.map(_.paddedGuide).getOrElse(""),
-              aln_alignment_string  = alignment.map(_.paddedAlignment).getOrElse(""),
-              aln_padded_target     = alignment.map(_.paddedTarget).getOrElse(""),
-              aln_mismatches        = alignment.map(_.mismatches).getOrElse(-1),
-              aln_gap_bases         = alignment.map(_.gapBases).getOrElse(-1),
-              aln_mm_and_gaps       = alignment.map(_.edits).getOrElse(-1)
-            ))
+            if (ok(fStartCount, rStartCount, depth, params)) {
+              val cut = CutSiteInfo(
+                sample                = sample,
+                guide                 = params.guide.getOrElse(""),
+                enzyme                = params.enzyme.getOrElse(""),
+                expected_overhang     = overhang,
+                window_size           = params.maxOffset * 2 + 1,
+                mapq_cutoff           = this.minMapQ,
+                chrom                 = chrom,
+                pos                   = pos - 1,
+                strand                = "F",
+                low_mapq_fraction     = lowMapqFraction(pos),
+                forward_starts        = fStartCount,
+                reverse_starts        = rStartCount,
+                read_depth            = depth,
+                template_depth        = tDepth,
+                read_fraction_cut     = (fStartCount + rStartCount) / depth.toDouble,
+                read_score            = score(pValue(fStartCount+rStartCount, depth, params.readStartProbability)),
+                template_fraction_cut = (fStartCount + rStartCount) / tDepth.toDouble,
+                template_score        = score(pValue(fStartCount+rStartCount, tDepth, params.templateStartProbability)),
+                median_overhang       = medianOverhang,
+                overhang_distribution = fs.mkString(";"),
+                neighborhood_ratio    = nearby,
+                aln_start             = alignment.map(_.start - 1).getOrElse(-1),
+                aln_end               = alignment.map(_.end).getOrElse(-1),
+                aln_strand            = alignment.map(_.strand.toString).getOrElse(""),
+                aln_padded_guide      = alignment.map(_.paddedGuide).getOrElse(""),
+                aln_alignment_string  = alignment.map(_.paddedAlignment).getOrElse(""),
+                aln_padded_target     = alignment.map(_.paddedTarget).getOrElse(""),
+                aln_mismatches        = alignment.map(_.mismatches).getOrElse(-1),
+                aln_gap_bases         = alignment.map(_.gapBases).getOrElse(-1),
+                aln_mm_and_gaps       = alignment.map(_.edits).getOrElse(-1)
+              )
+              candidates += cut
+            }
           }
 
           // rev = Guide matches rev sequence, binds to fwd strand, yielding clean cut on fwd and variable cut on rev strand
-          val rev = {
+          {
             val rPos           = pos - 1 + overhang
             val rRange         = Range.inclusive(rPos-params.maxOffset, rPos+params.maxOffset)
             val fStartCount    = fStarts(pos)
@@ -285,51 +290,52 @@ object IdentifyCutSites {
             val depth          = readDepth(pos) + bonusDepth
             val tDepth         = templateDepth(pos) + bonusDepth
 
-            if (!ok(fStartCount, rStartCount, depth, params)) None else Some(CutSiteInfo(
-              sample                = sample,
-              guide                 = params.guide.getOrElse(""),
-              enzyme                = params.enzyme.getOrElse(""),
-              expected_overhang     = overhang,
-              window_size           = params.maxOffset * 2 + 1,
-              mapq_cutoff           = this.minMapQ,
-              chrom                 = chrom,
-              pos                   = pos - 1,
-              strand                = "R",
-              low_mapq_fraction     = lowMapqFraction(pos),
-              forward_starts        = fStartCount,
-              reverse_starts        = rStartCount,
-              read_depth            = depth,
-              template_depth        = tDepth,
-              read_fraction_cut     = (fStartCount + rStartCount) / depth.toDouble,
-              read_score            = score(pValue(fStartCount+rStartCount, depth, params.readStartProbability)),
-              template_fraction_cut = (fStartCount + rStartCount) / tDepth.toDouble,
-              template_score        = score(pValue(fStartCount+rStartCount, tDepth, params.templateStartProbability)),
-              median_overhang       = medianOverhang,
-              overhang_distribution = rs.mkString(";"),
-              neighborhood_ratio    = nearby,
-              aln_start             = alignment.map(_.start - 1).getOrElse(-1),
-              aln_end               = alignment.map(_.end).getOrElse(-1),
-              aln_strand            = alignment.map(_.strand.toString).getOrElse(""),
-              aln_padded_guide      = alignment.map(_.paddedGuide).getOrElse(""),
-              aln_alignment_string  = alignment.map(_.paddedAlignment).getOrElse(""),
-              aln_padded_target     = alignment.map(_.paddedTarget).getOrElse(""),
-              aln_mismatches        = alignment.map(_.mismatches).getOrElse(-1),
-              aln_gap_bases         = alignment.map(_.gapBases).getOrElse(-1),
-              aln_mm_and_gaps       = alignment.map(_.edits).getOrElse(-1)
-            ))
-          }
-
-          (fwd, rev) match {
-            case (None,    None   ) => None
-            case (Some(f), None   ) => fwd
-            case (None,    Some(r)) => rev
-            case (Some(f), Some(r)) => if (r.template_score > f.template_score) rev else fwd
+            if (ok(fStartCount, rStartCount, depth, params))  {
+              val cut = CutSiteInfo(
+                sample                = sample,
+                guide                 = params.guide.getOrElse(""),
+                enzyme                = params.enzyme.getOrElse(""),
+                expected_overhang     = overhang,
+                window_size           = params.maxOffset * 2 + 1,
+                mapq_cutoff           = this.minMapQ,
+                chrom                 = chrom,
+                pos                   = pos - 1,
+                strand                = "R",
+                low_mapq_fraction     = lowMapqFraction(pos),
+                forward_starts        = fStartCount,
+                reverse_starts        = rStartCount,
+                read_depth            = depth,
+                template_depth        = tDepth,
+                read_fraction_cut     = (fStartCount + rStartCount) / depth.toDouble,
+                read_score            = score(pValue(fStartCount+rStartCount, depth, params.readStartProbability)),
+                template_fraction_cut = (fStartCount + rStartCount) / tDepth.toDouble,
+                template_score        = score(pValue(fStartCount+rStartCount, tDepth, params.templateStartProbability)),
+                median_overhang       = medianOverhang,
+                overhang_distribution = rs.mkString(";"),
+                neighborhood_ratio    = nearby,
+                aln_start             = alignment.map(_.start - 1).getOrElse(-1),
+                aln_end               = alignment.map(_.end).getOrElse(-1),
+                aln_strand            = alignment.map(_.strand.toString).getOrElse(""),
+                aln_padded_guide      = alignment.map(_.paddedGuide).getOrElse(""),
+                aln_alignment_string  = alignment.map(_.paddedAlignment).getOrElse(""),
+                aln_padded_target     = alignment.map(_.paddedTarget).getOrElse(""),
+                aln_mismatches        = alignment.map(_.mismatches).getOrElse(-1),
+                aln_gap_bases         = alignment.map(_.gapBases).getOrElse(-1),
+                aln_mm_and_gaps       = alignment.map(_.edits).getOrElse(-1)
+              )
+              candidates += cut
+            }
           }
         }
 
-        if (cuts.isEmpty) None else Some(cuts.maxBy(_.template_score))
+        if (candidates.isEmpty) {
+          None
+        } else {
+          Some(candidates.maxBy(_.template_score))
+        }
       }
     }
+
 
     /** Turn a putative p-value into a score, accounting for the fact that the p-value may have underflowed. */
     private def score(pvalue: Double): Double = {
