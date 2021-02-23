@@ -1,8 +1,8 @@
 package com.editasmedicine.aligner
 
 import java.io.PrintStream
-
 import com.fulcrumgenomics.FgBioDef._
+import com.fulcrumgenomics.alignment.Aligner.AlignmentScorer
 import com.fulcrumgenomics.alignment.LinearMatrix
 import com.fulcrumgenomics.alignment.Mode.Glocal
 import htsjdk.samtools.reference.ReferenceSequenceFile
@@ -141,7 +141,20 @@ class Aligner(refFile: ReferenceSequenceFile,
   require(refFile.isIndexed, s"Cannot work with a non-indexed reference: $refFile")
 
   // The actual aligner
-  private val nw = new com.fulcrumgenomics.alignment.Aligner(Aligner.score, gapOpen= -abs(gapOpen), gapExtend= -abs(gapExtend), mode=Glocal)
+  private val nw = {
+    val scorer = new AlignmentScorer {
+      private val open   = -abs(gapOpen)
+      private val extend = -abs(gapExtend)
+      private val openAndExtend = open + extend
+
+      override def scorePairing(queryBase: Byte, targetBase: Byte): Int = Aligner.score(queryBase, targetBase)
+      override def scoreGap(query: Array[Byte], target: Array[Byte], qOffset: Int, tOffset: Int, gapIsInQuery: Boolean, extend: Boolean): Int = {
+          if (extend) this.extend else this.openAndExtend
+      }
+    }
+
+    new com.fulcrumgenomics.alignment.Aligner(scorer, mode=Glocal)
+  }
 
   /**
     * Aligns a guide sequence to a region around the given position.  Attempts alignment on both the F and R

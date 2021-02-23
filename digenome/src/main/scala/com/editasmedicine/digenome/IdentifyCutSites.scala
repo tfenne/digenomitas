@@ -5,6 +5,7 @@ import java.io.Closeable
 import com.editasmedicine.aligner.Aligner
 import com.editasmedicine.commons.clp.{ClpGroups, EditasTool}
 import com.fulcrumgenomics.FgBioDef._
+import com.fulcrumgenomics.fasta.Converters._
 import com.fulcrumgenomics.bam.api.{QueryType, SamRecord, SamSource}
 import com.fulcrumgenomics.commons.io.Io
 import com.fulcrumgenomics.commons.util.NumericCounter
@@ -495,7 +496,7 @@ class IdentifyCutSites
       val name = source.toSamReader.getResourceDescription
       require(source.header.getSortOrder == SortOrder.coordinate, s"Input BAM is not coordinate sorted: $name")
       require(source.indexed, s"Input BAM is not indexed: $name")
-      require(source.dict.isSameDictionary(dict), s"Input BAMs doesn't match provided reference: $name.")
+      require(source.dict.sameAs(dict.fromSam), s"Input BAMs doesn't match provided reference: $name.")
     }
 
     logger.info(f"Sampling reads to determine read length and insert size.")
@@ -559,7 +560,7 @@ class IdentifyCutSites
 
       forloop(from=start, until=end+1) { pos =>
         accumulator.build(pos, params) match {
-            case None => Unit
+            case None       => ()
             case Some(best) =>
               if (buffer.nonEmpty && buffer.last.pos < best.pos-windowSize) flushBuffer()
               buffer += best

@@ -8,6 +8,7 @@ import com.fulcrumgenomics.commons.collection.SelfClosingIterator
 import com.fulcrumgenomics.sopt.cmdline.ValidationException
 import com.fulcrumgenomics.testing.{ReferenceSetBuilder, SamBuilder}
 import com.fulcrumgenomics.testing.SamBuilder.{Minus, Plus}
+import com.fulcrumgenomics.fasta.Converters._
 import com.fulcrumgenomics.util.Metric
 import htsjdk.samtools.reference.ReferenceSequenceFileFactory
 import htsjdk.samtools.util.Interval
@@ -49,7 +50,7 @@ class IdentifyCutSitesTest extends UnitSpec {
       .add("N", 1000) // 3000
     val path = builder.toTempFile()
     val ref = ReferenceSequenceFileFactory.getReferenceSequenceFile(path)
-    (path, ref, ref.getSequenceDictionary)
+    (path, ref, ref.getSequenceDictionary.fromSam)
   }
 
   /** Generates a SamBuilder for building up SamRecords for testing. */
@@ -104,7 +105,7 @@ class IdentifyCutSitesTest extends UnitSpec {
     builder.addPair(start1=1000, start2=1400)
     builder.addPair(start1=1000, start2=8000) // should be filtered out
 
-    val (rlen, isize) = IdentifyCutSites.determineReadLengthAndInsertSize(Seq(new SelfClosingIterator(builder.iterator, () => Unit)))
+    val (rlen, isize) = IdentifyCutSites.determineReadLengthAndInsertSize(Seq(new SelfClosingIterator(builder.iterator, () => ())))
     rlen shouldBe 100
     isize shouldBe 400
   }
@@ -119,7 +120,7 @@ class IdentifyCutSitesTest extends UnitSpec {
     builder2.addPair(start1=1100, start2=1400) // isize = 500
     builder2.addPair(start1=1100, start2=1500) // isize = 600
 
-    val iter = new SelfClosingIterator(builder1.iterator ++ builder2.iterator, () => Unit)
+    val iter = new SelfClosingIterator(builder1.iterator ++ builder2.iterator, () => ())
     val (rlen, isize) = IdentifyCutSites.determineReadLengthAndInsertSize(Seq(iter))
     rlen shouldBe (4*100 + 8*200) / 12
     isize shouldBe 450
