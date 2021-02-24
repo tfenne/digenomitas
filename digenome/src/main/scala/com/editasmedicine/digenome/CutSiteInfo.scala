@@ -6,9 +6,10 @@ object CutSiteInfo {
   val ScientificFormatString = "0.0000E00"
   private val scientificFormat = new java.text.DecimalFormat(ScientificFormatString)
   private val binomial = new com.fulcrumgenomics.math.BinomialDistribution
+  val Version = getClass.getPackage.getImplementationVersion
 }
 
-case class CutSiteInfo(digenomitas_version: String = getClass.getPackage.getImplementationVersion,
+case class CutSiteInfo(digenomitas_version: String = CutSiteInfo.Version,
                        sample: String,
                        guide: String,
                        enzyme: String,

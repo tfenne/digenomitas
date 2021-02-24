@@ -67,7 +67,7 @@ class FqPairIterator(r1s: Seq[BetterBufferedIterator[FastqRecord]], r2s: Seq[Bet
     * but their names differ.
     */
   def assertValid(): Unit = (r1Iterator.headOption, r2Iterator.headOption) match {
-    case (None, None)     => Unit
+    case (None, None)     => ()
     case (Some(r1), None) => throw new IllegalStateException(s"R2 exhausted, but R1 still has records. Next record: ${r1.name}")
     case (None, Some(r2)) => throw new IllegalStateException(s"R1 exhausted, but R2 still has records. Next record: ${r2.name}")
     case (Some(r1), Some(r2)) =>

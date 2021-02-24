@@ -8,6 +8,7 @@ import com.fulcrumgenomics.commons.collection.SelfClosingIterator
 import com.fulcrumgenomics.sopt.cmdline.ValidationException
 import com.fulcrumgenomics.testing.{ReferenceSetBuilder, SamBuilder}
 import com.fulcrumgenomics.testing.SamBuilder.{Minus, Plus}
+import com.fulcrumgenomics.fasta.Converters._
 import com.fulcrumgenomics.util.Metric
 import htsjdk.samtools.reference.ReferenceSequenceFileFactory
 import htsjdk.samtools.util.Interval
@@ -23,7 +24,8 @@ class IdentifyCutSitesTest extends UnitSpec {
     enzyme                = Some("SpyCas9"),
     pamFivePrime          = None,
     pamThreePrime         = Some("NGG"),
-    overhang              = 0,
+    minOverhang           = 0,
+    maxOverhang           = 0,
     maxOffset             = 2,
     minDepth              = 10,
     maxDepth              = 300,
@@ -49,7 +51,7 @@ class IdentifyCutSitesTest extends UnitSpec {
       .add("N", 1000) // 3000
     val path = builder.toTempFile()
     val ref = ReferenceSequenceFileFactory.getReferenceSequenceFile(path)
-    (path, ref, ref.getSequenceDictionary)
+    (path, ref, ref.getSequenceDictionary.fromSam)
   }
 
   /** Generates a SamBuilder for building up SamRecords for testing. */
@@ -104,7 +106,7 @@ class IdentifyCutSitesTest extends UnitSpec {
     builder.addPair(start1=1000, start2=1400)
     builder.addPair(start1=1000, start2=8000) // should be filtered out
 
-    val (rlen, isize) = IdentifyCutSites.determineReadLengthAndInsertSize(Seq(new SelfClosingIterator(builder.iterator, () => Unit)))
+    val (rlen, isize) = IdentifyCutSites.determineReadLengthAndInsertSize(Seq(new SelfClosingIterator(builder.iterator, () => ())))
     rlen shouldBe 100
     isize shouldBe 400
   }
@@ -119,7 +121,7 @@ class IdentifyCutSitesTest extends UnitSpec {
     builder2.addPair(start1=1100, start2=1400) // isize = 500
     builder2.addPair(start1=1100, start2=1500) // isize = 600
 
-    val iter = new SelfClosingIterator(builder1.iterator ++ builder2.iterator, () => Unit)
+    val iter = new SelfClosingIterator(builder1.iterator ++ builder2.iterator, () => ())
     val (rlen, isize) = IdentifyCutSites.determineReadLengthAndInsertSize(Seq(iter))
     rlen shouldBe (4*100 + 8*200) / 12
     isize shouldBe 450
@@ -349,7 +351,7 @@ class IdentifyCutSitesTest extends UnitSpec {
     forloop(from=0, until=9)  { i => builder.addPair(start1=1502, start2=1711) }
 
     acc ++= builder
-    acc.build(1500, DefaultParams.copy(overhang=0, maxOffset=1)) match {
+    acc.build(1500, DefaultParams.withOverhang(0).copy(maxOffset=1)) match {
       case None => fail("Failed to generate a cut site at pos=1500.")
       case Some(cut) =>
         cut.strand shouldBe "F" // guide "should" match F strand
@@ -373,7 +375,7 @@ class IdentifyCutSitesTest extends UnitSpec {
     forloop(from=0, until=31) { i => builder.addPair(start1=1500, start2=1700) }
 
     acc ++= builder
-    acc.build(1500, DefaultParams.copy(overhang=0, maxOffset=1)) match {
+    acc.build(1500, DefaultParams.withOverhang(0).copy(maxOffset=1)) match {
       case None => fail("Failed to generate a cut site at pos=1500.")
       case Some(cut) =>
         cut.strand shouldBe "R" // guide "should" match R strand
@@ -398,7 +400,7 @@ class IdentifyCutSitesTest extends UnitSpec {
 
     acc ++= builder
     (0 to 3) foreach { offset =>
-      acc.build(1500, DefaultParams.copy(overhang=0, maxOffset=offset)) match {
+      acc.build(1500, DefaultParams.withOverhang(0).copy(maxOffset=offset)) match {
         case None      => fail("Failed to generate a cut site at pos=1500.")
         case Some(cut) =>
           cut.strand shouldBe "F" // guide "should" match F strand
@@ -419,7 +421,7 @@ class IdentifyCutSitesTest extends UnitSpec {
 
     acc ++= builder
     (0 to 3) foreach { offset =>
-      acc.build(1500, DefaultParams.copy(overhang=0, maxOffset=offset)) match {
+      acc.build(1500, DefaultParams.withOverhang(0).copy(maxOffset=offset)) match {
         case None      => fail("Failed to generate a cut site at pos=1500.")
         case Some(cut) =>
           cut.strand shouldBe "R" // guide "should" match R strand
@@ -473,7 +475,7 @@ class IdentifyCutSitesTest extends UnitSpec {
      val bams = builders.map(_.toTempFile())
      val out = makeTempFile("metrics.", ".txt")
      new IdentifyCutSites(input=bams, output=out, guide=Some("CTATTTCTCGATCGATCGAT"), pamThreePrime=Some("NGG"), enzyme=Some("SpyCas9"),
-       ref=refFile, overhang= -2, maxOffset=1, minDepth=5).execute()
+       ref=refFile, overhang=Seq(-2), maxOffset=1, minDepth=5).execute()
      val metrics = Metric.read[CutSiteInfo](out)
 
      metrics.size shouldBe 1
@@ -490,4 +492,51 @@ class IdentifyCutSitesTest extends UnitSpec {
      cut.overhang_distribution shouldBe "12;50;15"
    }
   }
+
+  it should "identify the optimal cut site when an overhang range is used" in {
+     val builder = newBuilder(150)
+
+     // Evenly spaced reads up to around 2000
+     for (pos <- Range.inclusive(start=200,end=2000,step=5)) {
+       builder.addPair(start1=pos-199, start2=pos-105)
+     }
+
+     // Evenly spaced reads from around 2200
+     for (pos <- Range.inclusive(start=2300,end=4000,step=5)) {
+       builder.addPair(start1=pos, start2=pos+110)
+     }
+
+     // A bunch of stuff for an F-strand cut site at 2150
+     //  - Nearly all R reads on site, but with a tiny wobble
+     //  - A good spread of F reads around the expected site with overhang: 4
+     forloop (from=0, until=1)  { i => builder.addPair(start1=1960, start2=2000)   }
+     forloop (from=0, until=80) { i => builder.addPair(start1=1950-i, start2=2001) }
+     forloop (from=0, until=1)  { i => builder.addPair(start1=1960, start2=2002)   }
+
+     forloop (from=0, until= 2) { _ => builder.addPair(start1=2145, start2=2267) } // overhang=6
+     forloop (from=0, until=12) { _ => builder.addPair(start1=2146, start2=2271) } // overhang=5
+     forloop (from=0, until=50) { _ => builder.addPair(start1=2147, start2=2264) } // overhang=4
+     forloop (from=0, until=15) { _ => builder.addPair(start1=2148, start2=2283) } // overhang=3
+     forloop (from=0, until= 3) { _ => builder.addPair(start1=2149, start2=2277) } // overhang=2
+
+     val bam = builder.toTempFile()
+     val out = makeTempFile("metrics.", ".txt")
+     new IdentifyCutSites(input=Seq(bam), output=out, guide=Some("CTATTTCTCGATCGATCGAT"), pamThreePrime=Some("NGG"), enzyme=Some("SpyCas9"),
+       ref=refFile, overhang=Seq(2, 8), maxOffset=2, minDepth=5).execute()
+     val metrics = Metric.read[CutSiteInfo](out)
+
+     metrics.size shouldBe 1
+     val cut = metrics.head
+     cut.chrom                 shouldBe "chr1"
+     cut.pos                   shouldBe 2149 // output is 0-based
+     cut.strand                shouldBe "F"
+     cut.expected_overhang     shouldBe 4
+     cut.median_overhang       shouldBe 4
+     cut.forward_starts        shouldBe 82 // 2 + 12 + 50 + 15 + 3
+     cut.reverse_starts        shouldBe 80
+     cut.read_depth            shouldBe 163 // the starts, plus one rogue F read that's one base too far away
+     cut.read_fraction_cut     shouldBe 162/163d +- 0.0001
+     cut.template_fraction_cut shouldBe 162/163d +- 0.0001
+     cut.overhang_distribution shouldBe "2;12;50;15;3"
+   }
 }

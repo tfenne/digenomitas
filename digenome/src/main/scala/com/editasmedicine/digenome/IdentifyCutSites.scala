@@ -1,10 +1,10 @@
 package com.editasmedicine.digenome
 
 import java.io.Closeable
-
 import com.editasmedicine.aligner.Aligner
 import com.editasmedicine.commons.clp.{ClpGroups, EditasTool}
 import com.fulcrumgenomics.FgBioDef._
+import com.fulcrumgenomics.fasta.Converters._
 import com.fulcrumgenomics.bam.api.{QueryType, SamRecord, SamSource}
 import com.fulcrumgenomics.commons.io.Io
 import com.fulcrumgenomics.commons.util.NumericCounter
@@ -16,6 +16,7 @@ import htsjdk.samtools.util.{CoordMath, Interval, IntervalList}
 import org.apache.commons.math3.distribution.PoissonDistribution
 
 import scala.collection.mutable
+import scala.collection.mutable.ArrayBuffer
 import scala.math.{log10, max, min}
 
 object IdentifyCutSites {
@@ -29,7 +30,8 @@ object IdentifyCutSites {
     * @param pamFivePrime the optional sequence of any PAM at the 5' end of the guide
     * @param pamThreePrime the optional sequence of any PAM at the 3' end of the guide
     * @param enzyme optionally the enzyme used in the cutting reaction
-    * @param overhang the expected overhang at the cut sites (positive for overhang, negative for gapped)
+    * @param minOverhang the minimum expected overhang at the cut sites (positive for overhang, negative for gapped)
+    * @param maxOverhang the minimum expected overhang at the cut sites (positive for overhang, negative for gapped)
     * @param maxOffset the maximum offset from the expected cut site at which to count read starts of the opposite strand
     * @param minDepth the minimum number of reads covering a site in order to emit
     * @param maxDepth the maximum number of reads covering a site in order to emit
@@ -45,7 +47,8 @@ object IdentifyCutSites {
                            pamFivePrime: Option[String],
                            pamThreePrime: Option[String],
                            enzyme: Option[String],
-                           overhang: Int,
+                           minOverhang: Int,
+                           maxOverhang: Int,
                            maxOffset: Int,
                            minDepth: Int,
                            maxDepth: Int,
@@ -56,6 +59,9 @@ object IdentifyCutSites {
                            minSupportingFraction: Double
                            ) {
 
+    /** A copy of this object with min and max overhang set to the new value. */
+    def withOverhang(oh: Int): CutSiteParams = copy(minOverhang=oh, maxOverhang=oh)
+
     /** The guide with the PAM concatenated to it. Guide sequence is upper case.  PAM sequence is lower case. */
     val guidePlusPam: Option[String] = guide.map(pamFivePrime.getOrElse("").toLowerCase + _.toUpperCase + pamThreePrime.getOrElse("").toLowerCase)
 
@@ -64,6 +70,8 @@ object IdentifyCutSites {
 
     /** The probability of a read starting at a cut site given that the template covers the cut site. */
     val templateStartProbability:Double = (1 + Range.inclusive(-maxOffset, maxOffset).length) / insertSize.toDouble
+
+    val overhangs: Range = Range.inclusive(minOverhang, maxOverhang)
   }
 
   /**
@@ -197,127 +205,137 @@ object IdentifyCutSites {
         None
       }
       else {
-        // Construct a neighborhood measure of start site frequency vs. depth. The measure will be approximately
-        // 1 when the rate of start sites vs. depth is expected/random, and approximately 0 when there is coverage
-        // but no read starts.
-        lazy val nearby = {
-          var totalDepth  = 0
-          var totalStarts = 0
-          val startDistance = math.abs(params.overhang) + params.maxOffset + 2
+        val candidates = new ArrayBuffer[CutSiteInfo](params.overhangs.size * 2)
 
-          forloop(from=startDistance, until=startDistance+75) { i =>
-            totalDepth  += templateDepth(pos+i)
-            totalStarts += fStarts(pos+i)
-            totalDepth  += templateDepth(pos-i)
-            totalStarts += rStarts(pos-i)
+        params.overhangs.foreach { overhang =>
+          // Construct a neighborhood measure of start site frequency vs. depth. The measure will be approximately
+          // 1 when the rate of start sites vs. depth is expected/random, and approximately 0 when there is coverage
+          // but no read starts.
+          lazy val nearby = {
+            var totalDepth  = 0
+            var totalStarts = 0
+            val startDistance = math.abs(overhang) + params.maxOffset + 2
+
+            forloop(from=startDistance, until=startDistance+75) { i =>
+              totalDepth  += templateDepth(pos+i)
+              totalStarts += fStarts(pos+i)
+              totalDepth  += templateDepth(pos-i)
+              totalStarts += rStarts(pos-i)
+            }
+
+            totalStarts / totalDepth.toDouble * params.insertSize
           }
 
-          totalStarts / totalDepth.toDouble * params.insertSize
+          // Lazily generate an alignment of the guide to the genome at this position
+          lazy val alignment = params.guidePlusPam.map(query => this.aligner.align(query, chrom, pos))
+
+          // fwd = Guide matches fwd sequence, binds to rev strand, yielding clean cut on rev and variable cut on fwd strand
+          {
+            val fPos           = pos + 1 - overhang
+            val fRange         = Range.inclusive(fPos - params.maxOffset, fPos + params.maxOffset)
+            val fs             = fRange.map(fStarts)
+            val fStartCount    = fs.sum
+            val medianOverhang = median(fs.reverse, fStartCount) - params.maxOffset + overhang
+            val rStartCount    = rStarts(pos)
+            val bonusDepth     = fRange.iterator.filter(_ > pos).map(this.fStarts).sum
+            val depth          = readDepth(pos) + bonusDepth
+            val tDepth         = templateDepth(pos) + bonusDepth
+
+            if (ok(fStartCount, rStartCount, depth, params)) {
+              val cut = CutSiteInfo(
+                sample                = sample,
+                guide                 = params.guide.getOrElse(""),
+                enzyme                = params.enzyme.getOrElse(""),
+                expected_overhang     = overhang,
+                window_size           = params.maxOffset * 2 + 1,
+                mapq_cutoff           = this.minMapQ,
+                chrom                 = chrom,
+                pos                   = pos - 1,
+                strand                = "F",
+                low_mapq_fraction     = lowMapqFraction(pos),
+                forward_starts        = fStartCount,
+                reverse_starts        = rStartCount,
+                read_depth            = depth,
+                template_depth        = tDepth,
+                read_fraction_cut     = (fStartCount + rStartCount) / depth.toDouble,
+                read_score            = score(pValue(fStartCount+rStartCount, depth, params.readStartProbability)),
+                template_fraction_cut = (fStartCount + rStartCount) / tDepth.toDouble,
+                template_score        = score(pValue(fStartCount+rStartCount, tDepth, params.templateStartProbability)),
+                median_overhang       = medianOverhang,
+                overhang_distribution = fs.mkString(";"),
+                neighborhood_ratio    = nearby,
+                aln_start             = alignment.map(_.start - 1).getOrElse(-1),
+                aln_end               = alignment.map(_.end).getOrElse(-1),
+                aln_strand            = alignment.map(_.strand.toString).getOrElse(""),
+                aln_padded_guide      = alignment.map(_.paddedGuide).getOrElse(""),
+                aln_alignment_string  = alignment.map(_.paddedAlignment).getOrElse(""),
+                aln_padded_target     = alignment.map(_.paddedTarget).getOrElse(""),
+                aln_mismatches        = alignment.map(_.mismatches).getOrElse(-1),
+                aln_gap_bases         = alignment.map(_.gapBases).getOrElse(-1),
+                aln_mm_and_gaps       = alignment.map(_.edits).getOrElse(-1)
+              )
+              candidates += cut
+            }
+          }
+
+          // rev = Guide matches rev sequence, binds to fwd strand, yielding clean cut on fwd and variable cut on rev strand
+          {
+            val rPos           = pos - 1 + overhang
+            val rRange         = Range.inclusive(rPos-params.maxOffset, rPos+params.maxOffset)
+            val fStartCount    = fStarts(pos)
+            val rs             = rRange.map(this.rStarts).reverse
+            val rStartCount    = rs.sum
+            val medianOverhang = median(rs.reverse, rStartCount) - params.maxOffset + overhang
+            val bonusDepth     = rRange.iterator.filter(_ < pos).map(this.rStarts).sum
+            val depth          = readDepth(pos) + bonusDepth
+            val tDepth         = templateDepth(pos) + bonusDepth
+
+            if (ok(fStartCount, rStartCount, depth, params))  {
+              val cut = CutSiteInfo(
+                sample                = sample,
+                guide                 = params.guide.getOrElse(""),
+                enzyme                = params.enzyme.getOrElse(""),
+                expected_overhang     = overhang,
+                window_size           = params.maxOffset * 2 + 1,
+                mapq_cutoff           = this.minMapQ,
+                chrom                 = chrom,
+                pos                   = pos - 1,
+                strand                = "R",
+                low_mapq_fraction     = lowMapqFraction(pos),
+                forward_starts        = fStartCount,
+                reverse_starts        = rStartCount,
+                read_depth            = depth,
+                template_depth        = tDepth,
+                read_fraction_cut     = (fStartCount + rStartCount) / depth.toDouble,
+                read_score            = score(pValue(fStartCount+rStartCount, depth, params.readStartProbability)),
+                template_fraction_cut = (fStartCount + rStartCount) / tDepth.toDouble,
+                template_score        = score(pValue(fStartCount+rStartCount, tDepth, params.templateStartProbability)),
+                median_overhang       = medianOverhang,
+                overhang_distribution = rs.mkString(";"),
+                neighborhood_ratio    = nearby,
+                aln_start             = alignment.map(_.start - 1).getOrElse(-1),
+                aln_end               = alignment.map(_.end).getOrElse(-1),
+                aln_strand            = alignment.map(_.strand.toString).getOrElse(""),
+                aln_padded_guide      = alignment.map(_.paddedGuide).getOrElse(""),
+                aln_alignment_string  = alignment.map(_.paddedAlignment).getOrElse(""),
+                aln_padded_target     = alignment.map(_.paddedTarget).getOrElse(""),
+                aln_mismatches        = alignment.map(_.mismatches).getOrElse(-1),
+                aln_gap_bases         = alignment.map(_.gapBases).getOrElse(-1),
+                aln_mm_and_gaps       = alignment.map(_.edits).getOrElse(-1)
+              )
+              candidates += cut
+            }
+          }
         }
 
-        // Lazily generate an alignment of the guide to the genome at this position
-        lazy val alignment = params.guidePlusPam.map(query => this.aligner.align(query, chrom, pos))
-
-        // fwd = Guide matches fwd sequence, binds to rev strand, yielding clean cut on rev and variable cut on fwd strand
-        val fwd = {
-          val fPos           = pos + 1 - params.overhang
-          val fRange         = Range.inclusive(fPos - params.maxOffset, fPos + params.maxOffset)
-          val fs             = fRange.map(fStarts)
-          val fStartCount    = fs.sum
-          val medianOverhang = median(fs.reverse, fStartCount) - params.maxOffset + params.overhang
-          val rStartCount    = rStarts(pos)
-          val bonusDepth     = fRange.iterator.filter(_ > pos).map(this.fStarts).sum
-          val depth          = readDepth(pos) + bonusDepth
-          val tDepth         = templateDepth(pos) + bonusDepth
-
-          if (!ok(fStartCount, rStartCount, depth, params)) None else Some(CutSiteInfo(
-            sample                = sample,
-            guide                 = params.guide.getOrElse(""),
-            enzyme                = params.enzyme.getOrElse(""),
-            expected_overhang     = params.overhang,
-            window_size           = params.maxOffset * 2 + 1,
-            mapq_cutoff           = this.minMapQ,
-            chrom                 = chrom,
-            pos                   = pos - 1,
-            strand                = "F",
-            low_mapq_fraction     = lowMapqFraction(pos),
-            forward_starts        = fStartCount,
-            reverse_starts        = rStartCount,
-            read_depth            = depth,
-            template_depth        = tDepth,
-            read_fraction_cut     = (fStartCount + rStartCount) / depth.toDouble,
-            read_score            = score(pValue(fStartCount+rStartCount, depth, params.readStartProbability)),
-            template_fraction_cut = (fStartCount + rStartCount) / tDepth.toDouble,
-            template_score        = score(pValue(fStartCount+rStartCount, tDepth, params.templateStartProbability)),
-            median_overhang       = medianOverhang,
-            overhang_distribution = fs.mkString(";"),
-            neighborhood_ratio    = nearby,
-            aln_start             = alignment.map(_.start - 1).getOrElse(-1),
-            aln_end               = alignment.map(_.end).getOrElse(-1),
-            aln_strand            = alignment.map(_.strand.toString).getOrElse(""),
-            aln_padded_guide      = alignment.map(_.paddedGuide).getOrElse(""),
-            aln_alignment_string  = alignment.map(_.paddedAlignment).getOrElse(""),
-            aln_padded_target     = alignment.map(_.paddedTarget).getOrElse(""),
-            aln_mismatches        = alignment.map(_.mismatches).getOrElse(-1),
-            aln_gap_bases         = alignment.map(_.gapBases).getOrElse(-1),
-            aln_mm_and_gaps       = alignment.map(_.edits).getOrElse(-1)
-          ))
-        }
-
-        // rev = Guide matches rev sequence, binds to fwd strand, yielding clean cut on fwd and variable cut on rev strand
-        val rev = {
-          val rPos           = pos - 1 + params.overhang
-          val rRange         = Range.inclusive(rPos-params.maxOffset, rPos+params.maxOffset)
-          val fStartCount    = fStarts(pos)
-          val rs             = rRange.map(this.rStarts).reverse
-          val rStartCount    = rs.sum
-          val medianOverhang = median(rs.reverse, rStartCount) - params.maxOffset + params.overhang
-          val bonusDepth     = rRange.iterator.filter(_ < pos).map(this.rStarts).sum
-          val depth          = readDepth(pos) + bonusDepth
-          val tDepth         = templateDepth(pos) + bonusDepth
-
-          if (!ok(fStartCount, rStartCount, depth, params)) None else Some(CutSiteInfo(
-            sample                = sample,
-            guide                 = params.guide.getOrElse(""),
-            enzyme                = params.enzyme.getOrElse(""),
-            expected_overhang     = params.overhang,
-            window_size           = params.maxOffset * 2 + 1,
-            mapq_cutoff           = this.minMapQ,
-            chrom                 = chrom,
-            pos                   = pos - 1,
-            strand                = "R",
-            low_mapq_fraction     = lowMapqFraction(pos),
-            forward_starts        = fStartCount,
-            reverse_starts        = rStartCount,
-            read_depth            = depth,
-            template_depth        = tDepth,
-            read_fraction_cut     = (fStartCount + rStartCount) / depth.toDouble,
-            read_score            = score(pValue(fStartCount+rStartCount, depth, params.readStartProbability)),
-            template_fraction_cut = (fStartCount + rStartCount) / tDepth.toDouble,
-            template_score        = score(pValue(fStartCount+rStartCount, tDepth, params.templateStartProbability)),
-            median_overhang       = medianOverhang,
-            overhang_distribution = rs.mkString(";"),
-            neighborhood_ratio    = nearby,
-            aln_start             = alignment.map(_.start - 1).getOrElse(-1),
-            aln_end               = alignment.map(_.end).getOrElse(-1),
-            aln_strand            = alignment.map(_.strand.toString).getOrElse(""),
-            aln_padded_guide      = alignment.map(_.paddedGuide).getOrElse(""),
-            aln_alignment_string  = alignment.map(_.paddedAlignment).getOrElse(""),
-            aln_padded_target     = alignment.map(_.paddedTarget).getOrElse(""),
-            aln_mismatches        = alignment.map(_.mismatches).getOrElse(-1),
-            aln_gap_bases         = alignment.map(_.gapBases).getOrElse(-1),
-            aln_mm_and_gaps       = alignment.map(_.edits).getOrElse(-1)
-          ))
-        }
-
-        (fwd, rev) match {
-          case (None,    None   ) => None
-          case (Some(f), None   ) => fwd
-          case (None,    Some(r)) => rev
-          case (Some(f), Some(r)) => if (r.template_score > f.template_score) rev else fwd
+        if (candidates.isEmpty) {
+          None
+        } else {
+          Some(candidates.maxBy(_.template_score))
         }
       }
     }
+
 
     /** Turn a putative p-value into a score, accounting for the fact that the p-value may have underflowed. */
     private def score(pvalue: Double): Double = {
@@ -449,7 +467,12 @@ class IdentifyCutSites
   @arg(flag='r', doc="Reference genome fasta file.") val ref: PathToFasta,
   @arg(flag='l', doc="Optional set of intervals to restrict analysis to.") val intervals: Option[PathToIntervals] = None,
   @arg(flag='m', doc="Discard reads below the given mapping quality.") val minMapQ: Int = 30,
-  @arg(          doc="The expected overhang at the cut site. Positive for 5' overhang, negative for 3'.") val overhang: Int = 0,
+  @arg(          minElements=1, maxElements=2, doc=
+    """
+      |The expected overhang at the cut site. Positive for 5' overhang, negative for 3'. Use a single value for
+      |a fixed overhang, or two values to denote the minimum and maximum expected overhang."""
+  )
+  val overhang: Seq[Int] = Seq(0),
   @arg(flag='x', doc="Counts reads starting this many bases from expected start sites.") val maxOffset: Int = 2,
   // Filtering arguments
   @arg(flag='N', doc="Minimum depth of coverage to output site.") val minDepth: Int = 10,
@@ -476,8 +499,10 @@ class IdentifyCutSites
   validate(minForwardReads    <= maxDepth, "min-forward-reads must be <= max-depth")
   validate(minReverseReads    <= maxDepth, "min-reverse-reads must be <= max-depth")
   validate(minSupportingReads <= maxDepth, "min-supporting-reads must be <= max-depth")
-
   validate(guide.isEmpty == enzyme.isEmpty, "Must provide both guide and enzyme or neither.")
+
+  validate(overhang.last >= overhang.head, "When specifying a range of overhang value the smaller value must come first.")
+
 
   val validBases = "ATUGCSWRYKMBVHDN"
   guide.foreach         { s => validate(s.forall(ch => validBases.indexOf(ch) >= 0), s"Guide $s contained invalid bases. May only contain $validBases.") }
@@ -495,7 +520,7 @@ class IdentifyCutSites
       val name = source.toSamReader.getResourceDescription
       require(source.header.getSortOrder == SortOrder.coordinate, s"Input BAM is not coordinate sorted: $name")
       require(source.indexed, s"Input BAM is not indexed: $name")
-      require(source.dict.isSameDictionary(dict), s"Input BAMs doesn't match provided reference: $name.")
+      require(source.dict.sameAs(dict.fromSam), s"Input BAMs doesn't match provided reference: $name.")
     }
 
     logger.info(f"Sampling reads to determine read length and insert size.")
@@ -515,7 +540,8 @@ class IdentifyCutSites
       pamFivePrime          = this.pamFivePrime,
       pamThreePrime         = this.pamThreePrime,
       enzyme                = this.enzyme,
-      overhang              = this.overhang,
+      minOverhang           = this.overhang.head,
+      maxOverhang           = this.overhang.last,
       maxOffset             = this.maxOffset,
       minDepth              = this.minDepth,
       maxDepth              = this.maxDepth,
@@ -545,21 +571,21 @@ class IdentifyCutSites
       // Window size is intended to capture the maximum distance between two "calls" that are likely
       // generated by the same actual cut site.  E.g with an overhang of -3 we might make one call
       // on the F strand and another call on the R strand 4 bases away.
-      val windowSize = math.abs(this.overhang) + 1
+      val windowSize = math.abs(this.overhang.max) + 1
 
       // Buffer the cut sites as we generate them and then only flush them once we have all the ones
       // that are nearby each other
       val buffer = new mutable.ArrayBuffer[CutSiteInfo]
 
       def flushBuffer(): Unit = {
-        if (buffer.size <= 1 || buffer.size > 10) buffer.foreach(out.write(_))
+        if (buffer.size <= 1 || buffer.size > 10) buffer.foreach(out.write)
         else out.write(buffer.maxBy(x => (x.template_score, x.template_fraction_cut)))
         buffer.clear()
       }
 
       forloop(from=start, until=end+1) { pos =>
         accumulator.build(pos, params) match {
-            case None => Unit
+            case None       => ()
             case Some(best) =>
               if (buffer.nonEmpty && buffer.last.pos < best.pos-windowSize) flushBuffer()
               buffer += best
